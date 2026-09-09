@@ -1,8 +1,10 @@
 # Core
-# Pinned below 1.0: openinference-instrumentation-anthropic 1.1.2 imports
-# anthropic.resources.completions, which 1.x removed, so instrument() raises
-# ModuleNotFoundError. Drop the upper bound once the instrumentor supports 1.x.
-anthropic>=0.40.0,<1.0
+# anthropic + instrumentor must move in lockstep: instrumentor 2.x declares
+# anthropic>=1.0.0 as its instrumentation target. A mismatch (e.g. anthropic<1.0
+# alongside instrumentor 1.1.2 or 2.x) makes AnthropicInstrumentor().instrument()
+# log one DependencyConflict ERROR and silently no-op — the app runs and prints
+# output but emits NO LLM spans. Verified working: anthropic 1.4.0 + instrumentor 2.1.2.
+anthropic>=1.0.0
 python-dotenv>=1.0.0
 opencv-python>=4.8.0
 
@@ -11,5 +13,5 @@ opentelemetry-api>=1.20.0
 opentelemetry-sdk>=1.20.0
 opentelemetry-exporter-otlp-proto-http>=1.20.0
 openinference-instrumentation>=0.1.0
-openinference-instrumentation-anthropic>=0.1.0
+openinference-instrumentation-anthropic>=2.0.0
 openinference-semantic-conventions>=0.1.0
