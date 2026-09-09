@@ -72,4 +72,10 @@ Two ordering rules:
 
 `openinference-instrumentation-anthropic` 2.x declares `anthropic>=1.0.0` as its instrumentation target. If the two packages fall out of sync (e.g. `anthropic<1.0` installed alongside instrumentor 2.x, or vice versa with 1.x), `AnthropicInstrumentor().instrument()` does **not** raise — `BaseInstrumentor.instrument()` checks the declared dependency range up front, and on a mismatch it logs one `ERROR`-level line (`DependencyConflict: requested "anthropic >= 1.0.0" but found "anthropic 0.125.0"`) and returns `None` without ever patching `messages.create`. The script keeps running — real API calls, correct answers, correct `@tracer.agent`/`@tracer.tool` spans — just with zero LLM spans, and nothing crashes to tell you why.
 
+If a trace shows `AGENT` and `TOOL` spans but no `LLM` spans, check the pair first:
+
+```bash
+pip show anthropic openinference-instrumentation-anthropic
+```
+
 (Older versions of this file recommended `anthropic<1.0` paired with `openinference-instrumentation-anthropic` 1.x, because instrumentor 1.1.2 imported `anthropic.resources.completions`, which the 1.x SDK removed. That combination still works, but the 1.x line of the instrumentor is no longer the actively developed one — this project now tracks the 2.x/anthropic-1.x pairing instead.)
