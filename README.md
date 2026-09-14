@@ -60,6 +60,7 @@ Lumoz uses **OpenInference**, the open source SDK for LLM application tracing, e
 |---------|-------------|
 | [travel-video-analyzer](langgraph/travel-video-analyzer) | Multi-agent supervisor pattern that analyzes travel videos using Claude Vision |
 | [research-writer](langgraph/research-writer) | Two-agent RAG pipeline — researcher searches a vector store, writer synthesizes findings |
+| [travel-agent](langgraph/travel-agent) | Booking assistant with safe/sensitive tool routing and human-in-the-loop approval; driven by scripted scenarios or an interactive REPL |
 
 ### Mastra
 
