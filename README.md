@@ -69,6 +69,12 @@ Lumoz uses **OpenInference**, the open source SDK for LLM application tracing, e
 | [simple/research-writer](mastra/simple/research-writer) | Sequential multi-agent workflow — single shared OTLP exporter, simplest setup to get started |
 | [subtenant/research-writer](mastra/subtenant/research-writer) | Same workflow with per-subtenant OTLP exporter isolation — each tenant gets its own export queue |
 
+### Phoenix
+
+| Example | Description |
+|---------|-------------|
+| [backfill](phoenix/backfill) | Utility that copies existing traces from an Arize Phoenix project into Lumoz, resumable and safe to re-run |
+
 ### Vanilla (plain Python)
 
 | Example | Description |

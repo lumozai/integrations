@@ -12,6 +12,7 @@ Public repository of runnable examples showing how to instrument AI agents with 
 | `langgraph/` | LangGraph via `LangChainInstrumentor` auto-instrumentation |
 | `google-adk/` | Google ADK, single-process and multi-agent over HTTP |
 | `mastra/` | Mastra in TypeScript, including per-subtenant exporter isolation |
+| `phoenix/backfill/` | Utility that copies existing Arize Phoenix traces into Lumoz, with a resumable watermark per project, app, and env |
 | `vanilla/` | Plain Python with OpenInference decorators, no framework |
 | `a2a/` | Agent-to-agent across ADK, LangGraph, and CrewAI |
 | `cli/subtenant/` | Sub-tenant routing from the CLI |
