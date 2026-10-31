@@ -1,0 +1,35 @@
+# Example for --redact-config. Every key is optional. With no config, --redact uses all built-in
+# detectors and masks matches as [REDACTED:EMAIL], [REDACTED:PHONE], ...
+
+# Built-in detectors to run. Default: all of them. Use [] to run only your own patterns.
+detectors: [email, phone, ssn, credit_card, ip, secret]
+
+# Your own regexes. The name appears in the placeholder: [REDACTED:EMPLOYEE_ID]
+patterns:
+  - name: employee_id
+    regex: 'EMP-\d{6}'
+  - name: order_number
+    regex: 'ORD-[A-Z0-9]{8}'
+
+# mask  -> [REDACTED:EMAIL]
+# hash  -> [EMAIL:3f9a1c0b2e], the same input always gives the same value
+# Hashing without a salt can be reversed by guessing likely values; set a salt here or in the
+# REDACT_SALT environment variable.
+action: mask
+# salt: change-me
+
+# Per-attribute rules (glob on the attribute name). The first match wins and overrides the
+# detectors and the skip list.
+#   drop - remove the attribute      mask / hash - replace the whole value
+#   keep - never touch it
+attributes:
+  metadata.customer_email: drop
+  metadata.account_number: hash
+  llm.input_messages.*.message.content: mask   # redact every message in full
+  # user.id: hash          # user.id and session.id are left as-is unless you add a rule here
+
+# Extra attributes to leave untouched. Already skipped by default: user.id, session.id,
+# openinference.span.kind, *.mime_type, llm.model_name, llm.provider, llm.system,
+# llm.finish_reason, tool.name, *.token_count.*
+skip:
+  - metadata.environment

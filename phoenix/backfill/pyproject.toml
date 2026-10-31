@@ -1,0 +1,16 @@
+[project]
+name = "phoenix-backfill"
+version = "0.1.0"
+description = "Copy traces from Arize Phoenix into Lumoz."
+requires-python = ">=3.11"
+dependencies = [
+    # The script reuses phoenix.trace (attribute decoding and OTLP encoding), so it needs the
+    # package even though your Phoenix server runs elsewhere. Pinned: those modules are internal.
+    "arize-phoenix==20.26.0",
+    "httpx>=0.27",
+    "python-dotenv>=1.0",
+    "pyyaml>=6.0",
+]
+
+[tool.uv]
+package = false

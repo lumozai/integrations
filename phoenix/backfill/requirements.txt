@@ -1,8 +1,0 @@
-# Python 3.11+
-
-# Phoenix. The script reuses phoenix.trace (attribute decoding and OTLP encoding), so it needs
-# the package even though your Phoenix server runs elsewhere. Pinned: those modules are internal.
-arize-phoenix==20.26.0
-
-httpx>=0.27
-python-dotenv>=1.0

@@ -39,9 +39,8 @@ from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import ExportTrace
 from opentelemetry.proto.common.v1.common_pb2 import AnyValue, KeyValue
 from opentelemetry.proto.trace.v1.trace_pb2 import ResourceSpans, ScopeSpans
 
-from phoenix.trace.attributes import load_json_strings, unflatten
-from phoenix.trace.otel import encode_span_to_otlp
-from phoenix.trace.schemas import Span, SpanContext, SpanEvent, SpanKind, SpanStatusCode
+from redact import ConfigError, RedactionError, Redactor
+
 
 DEFAULT_PHOENIX_URL = "http://localhost:6006"
 DEFAULT_LUMOZ_ENDPOINT = "https://api.lumoz.ai/proxy/v1/traces"
@@ -52,6 +51,46 @@ PAGE_SIZE = 500  # spans per Phoenix request (API max is 1000)
 BATCH_SIZE = 500  # max spans per Lumoz request
 MAX_BATCH_BYTES = 3 * 1024 * 1024  # starting size; a 413 ("Request Too Long") halves the batch and retries
 DEFAULT_SCOPE = "phoenix-backfill"
+
+
+def load_phoenix() -> None:
+    """Import the Phoenix client modules. Importing the phoenix package is slow (~20 s cold), so this runs
+    only once a run is under way (not for --help or --list-frameworks) and says so."""
+    global load_json_strings, unflatten, encode_span_to_otlp, Span, SpanContext, SpanEvent, SpanKind, SpanStatusCode
+    set_phase("loading")
+    print("Loading the Phoenix client library (slow on the first run) ...", flush=True)
+    from phoenix.trace.attributes import load_json_strings, unflatten
+    from phoenix.trace.otel import encode_span_to_otlp
+    from phoenix.trace.schemas import Span, SpanContext, SpanEvent, SpanKind, SpanStatusCode
+
+
+# What the script is doing right now. The Ctrl-C handler at the bottom reports it.
+STATUS: dict[str, Any] = {"phase": "starting", "read": 0, "sent": 0, "total": None, "dry_run": False, "detail": ""}
+_PHASE_LABEL = {"counting": "Counting new spans", "reading": "Reading spans"}
+_progress_open = False  # a "\r" status line is on screen and needs a newline before other output
+_last_progress = 0.0
+
+
+def set_phase(phase: str, detail: str = "") -> None:
+    STATUS.update(phase=phase, detail=detail)
+
+
+def progress(msg: str) -> None:
+    """Keep one status line up to date on a terminal; when piped, print at most every 10 seconds."""
+    global _progress_open, _last_progress
+    if sys.stdout.isatty():
+        print("\r\x1b[K" + msg, end="", flush=True)
+        _progress_open = True
+    elif time.monotonic() - _last_progress >= 10:
+        print(msg, flush=True)
+        _last_progress = time.monotonic()
+
+
+def progress_end(msg: str) -> None:
+    """Replace the status line (if any) with a final message and move to the next line."""
+    global _progress_open
+    print(("\r\x1b[K" if _progress_open else "") + msg, flush=True)
+    _progress_open = False
 # Frameworks whose instrumentation scope isn't "openinference.instrumentation.<label>".
 _DIRECT_SCOPES = {
     "vercel_ai": "ai",
@@ -83,7 +122,7 @@ def phoenix_client(url: str) -> httpx.Client:
     headers = {}
     if key := os.environ.get("PHOENIX_API_KEY"):
         headers["Authorization"] = f"Bearer {key}"
-    return httpx.Client(base_url=url.rstrip("/"), headers=headers, timeout=60)
+    return httpx.Client(base_url=url.rstrip("/"), headers=headers, timeout=httpx.Timeout(60.0, connect=10.0))
 
 
 def list_projects(client: httpx.Client) -> list[str]:
@@ -125,6 +164,9 @@ def _iter_pages(
         r = client.get(f"/v1/projects/{quote(project, safe='')}/spans", params=params)
         r.raise_for_status()
         body = r.json()
+        STATUS["read"] += len(body["data"])
+        if label := _PHASE_LABEL.get(STATUS["phase"]):
+            progress(f"  {label}: {STATUS['read']:,} read so far")
         yield from body["data"]
         cursor = body.get("next_cursor")
         if not cursor:
@@ -132,19 +174,33 @@ def _iter_pages(
 
 
 def iter_phoenix_spans(
-    client: httpx.Client, project: str, start: datetime, end: datetime
+    client: httpx.Client, project: str, start: datetime, end: datetime, cache: Optional[dict] = None
 ) -> Iterator[dict[str, Any]]:
     """Spans with start <= start_time < end, oldest first (start_time, then span_id).
 
     The watermark needs this order. A Phoenix without sort/order support returns newest-first, so
-    the window is read fully and sorted here (holds the window's spans in memory).
+    the window is read fully and sorted here (holds the window's spans in memory). `cache` lets a
+    second pass reuse that sorted window instead of fetching it again.
     """
+    if cache is not None and "spans" in cache:
+        yield from cache["spans"]
+        return
+    STATUS["read"] = 0
     if server_sorts_spans(client):
         yield from _iter_pages(client, project, start, end, True)
+        if STATUS["phase"] in _PHASE_LABEL:
+            progress_end(f"  {STATUS['read']:,} spans read from Phoenix")
         return
-    print("  note: this Phoenix can't sort spans server-side; reading the window into memory first")
+    print("  Phoenix can't sort spans itself, so the whole window is read into memory first")
+    earlier = STATUS["phase"]
+    set_phase("reading")
     spans = list(_iter_pages(client, project, start, end, False))
+    set_phase("sorting")
+    progress_end(f"  read {len(spans):,} spans; sorting by start time...")
     spans.sort(key=lambda s: (_dt(s["start_time"]), s["context"]["span_id"]))
+    set_phase(earlier)
+    if cache is not None:
+        cache["spans"] = spans
     yield from spans
 
 
@@ -284,8 +340,11 @@ def send_to_lumoz(req: ExportTraceServiceRequest, endpoint: str, api_key: str) -
                 raise PayloadTooLarge(r.text[:200])
             if r.status_code < 500 and r.status_code != 429:
                 raise SystemExit(f"Lumoz rejected batch: {r.status_code} {r.text[:300]}")
-        except httpx.TransportError:
-            pass
+            why = f"HTTP {r.status_code}"
+        except httpx.TransportError as e:
+            why = f"cannot connect ({type(e).__name__})"
+        if attempt < 4:
+            progress_end(f"  Lumoz: {why}; retrying in {2**attempt}s (attempt {attempt + 2} of 5)")
         time.sleep(2**attempt)
     raise SystemExit("Lumoz unreachable / failing after 5 attempts; watermark not advanced")
 
@@ -348,8 +407,7 @@ def choose_days(default: float) -> float:
         print("  enter a positive number")
 
 
-def choose_project(client: httpx.Client) -> str:
-    names = list_projects(client)
+def choose_project(names: list[str]) -> str:
     print("Phoenix projects:")
     for i, name in enumerate(names, 1):
         print(f"  {i}. {name}")
@@ -372,6 +430,9 @@ def main() -> None:
                     "Default: prompted when interactive, else left blank")
     ap.add_argument("--list-frameworks", action="store_true", help="print valid --framework names and exit")
     ap.add_argument("--allow-unknown-framework", action="store_true", help="accept a --framework not in the list")
+    ap.add_argument("--redact", action="store_true", help="redact PII (emails, phones, SSNs, cards, IPs, keys) before sending")
+    ap.add_argument("--redact-config", type=Path, help="YAML with custom patterns / per-attribute rules; implies --redact")
+    ap.add_argument("--show-redactions", action="store_true", help="print what was redacted, with samples of the ORIGINAL text")
     ap.add_argument("--endpoint", default=os.environ.get("OTEL_ENDPOINT", DEFAULT_LUMOZ_ENDPOINT))
     ap.add_argument("--state-file", type=Path, default=DEFAULT_STATE_FILE)
     ap.add_argument("--ignore-watermark", action="store_true", help="re-read the full --days window")
@@ -387,11 +448,17 @@ def main() -> None:
     if not api_key and not args.dry_run:
         sys.exit("Set LUMOZ_API_KEY")
 
-    if not (args.project and args.app and args.env) and not sys.stdin.isatty():
-        sys.exit("Not an interactive terminal: pass --project, --app and --env.")
-
+    STATUS["dry_run"] = args.dry_run
+    set_phase("connecting", args.phoenix_url)
+    print(f"Connecting to Phoenix at {args.phoenix_url} ...")
     client = phoenix_client(args.phoenix_url)
-    project = args.project or choose_project(client)
+    projects = list_projects(client)
+    print(f"  connected: {len(projects)} project(s) found")
+    load_phoenix()
+    set_phase("prompting")
+    if args.project and args.project not in projects:
+        sys.exit(f"Phoenix project '{args.project}' not found. Available: {', '.join(projects) or '(none)'}")
+    project = args.project or choose_project(projects)
     app = args.app or prompt("Lumoz app", project)  # defaults to the Phoenix project name
     env = args.env or prompt("Lumoz env", DEFAULT_ENV)
 
@@ -399,9 +466,24 @@ def main() -> None:
     if args.framework is None and interactive:
         args.framework = choose_framework()  # offer the list
 
+    if interactive and not (args.redact or args.redact_config):
+        args.redact = confirm("Redact PII before sending?", default=False)
+    redactor: Optional[Redactor] = None
+    if args.redact or args.redact_config:
+        try:
+            redactor = Redactor.from_config(args.redact_config)
+        except ConfigError as e:
+            sys.exit(f"Redaction config error: {e}")
+        if redactor.unsalted_hash:
+            print("  note: hashing without a salt can be reversed by guessing; set REDACT_SALT (or 'salt:' in the config)")
+    redaction_id = redactor.settings_id if redactor else None
+    print(f"PII redaction: {'on (settings ' + redaction_id + ')' if redactor else 'off'}")
+
     now = datetime.now(timezone.utc)
     state = load_state(args.state_file)
     entry = state.get(_key(project, app, env), {})
+    if entry and entry.get("redaction") != redaction_id:
+        print("  warning: redaction settings differ from the last run; spans already sent are not re-redacted")
     if args.days is None:
         args.days = choose_days(DEFAULT_DAYS) if interactive else DEFAULT_DAYS
     if entry and not args.ignore_watermark and interactive:
@@ -416,14 +498,20 @@ def main() -> None:
             start, seen = wm, set(entry.get("span_ids_at_watermark", []))
     print(f"{project} -> app={app} env={env}: reading {start.isoformat()} .. {now.isoformat()}")
 
+    window_cache: dict = {}  # filled only when Phoenix cannot sort, so the second pass skips the re-read
+
     def new_spans() -> Iterator[dict[str, Any]]:
-        for api_span in iter_phoenix_spans(client, project, start, now):
+        for api_span in iter_phoenix_spans(client, project, start, now, window_cache):
             if _dt(api_span["start_time"]) == start and api_span["context"]["span_id"] in seen:
                 continue
             yield api_span
 
     if interactive and not args.yes and not args.dry_run:
+        set_phase("counting")
+        print("Counting what is new (nothing is sent yet) ...")
         total = sum(1 for _ in new_spans())
+        STATUS["total"] = total
+        set_phase("prompting")
         if total == 0:
             print("Nothing new to send.")
             return
@@ -432,6 +520,9 @@ def main() -> None:
             return
 
     scope = framework_scope(args.framework)
+    set_phase("sending")
+    print("Converting spans (dry run, nothing is sent) ..." if args.dry_run
+          else f"Reading from Phoenix and sending in batches to {args.endpoint} ...")
     sent = 0
     batch: list = []
     batch_bytes = 0
@@ -447,15 +538,18 @@ def main() -> None:
             state[_key(project, app, env)] = {
                 "watermark": last_ts,
                 "span_ids_at_watermark": sorted(ids_at_last),
+                "redaction": redaction_id,
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }
             save_state(args.state_file, state)
         sent += len(batch)
+        STATUS["sent"] = sent
         batch, batch_bytes = [], 0
-        print(f"  {'would send' if args.dry_run else 'sent'} {sent} spans (through {last_ts})")
+        of = f" of {STATUS['total']:,}" if STATUS["total"] else ""
+        print(f"  {'would send' if args.dry_run else 'sent'} {sent:,}{of} spans (through {last_ts})")
 
     for api_span in new_spans():
-        otlp_span = to_otlp_span(api_span)
+        otlp_span = to_otlp_span(redactor.redact_span(api_span) if redactor else api_span)
         size = otlp_span.ByteSize()
         if batch and batch_bytes + size > MAX_BATCH_BYTES:
             flush()  # flush the spans before this one; last_ts/ids_at_last still describe them
@@ -472,7 +566,34 @@ def main() -> None:
         if len(batch) >= BATCH_SIZE:
             flush()
     flush()
+    if redactor:
+        print(redactor.report(show_samples=args.show_redactions))
     print(f"Done: {sent} spans {'(dry run)' if args.dry_run else 'sent'}.")
+
+
+def interrupt_message() -> str:
+    phase, detail, sent = STATUS["phase"], STATUS["detail"], STATUS["sent"]
+    read = f" ({STATUS['read']:,} spans read so far)" if STATUS["read"] else ""
+    if phase == "loading":
+        what, outcome = "while loading the Phoenix client library", "Nothing was read or sent."
+    elif phase == "connecting":
+        what, outcome = f"while connecting to Phoenix at {detail}", "Nothing was read or sent."
+    elif phase == "prompting":
+        what, outcome = "at a question", "Nothing was sent."
+    elif phase in ("counting", "reading", "sorting"):
+        what = {"counting": "while counting new spans", "reading": "while reading spans from Phoenix",
+                "sorting": "while sorting spans"}[phase] + read
+        outcome = "Nothing was sent."
+    elif STATUS["dry_run"]:
+        what, outcome = "during the dry run", "Nothing was sent and the saved position is unchanged."
+    elif sent:
+        what = "while sending"
+        outcome = (f"{sent:,} spans were sent and saved; the next run continues after them. "
+                   "The batch in flight was not saved and will be sent again.")
+    else:
+        what = "before the first batch was accepted"
+        outcome = "Nothing was saved; a batch in flight may have reached Lumoz and will be sent again."
+    return f"\nInterrupted {what}. {outcome}"
 
 
 if __name__ == "__main__":
@@ -482,5 +603,9 @@ if __name__ == "__main__":
         sys.exit(f"HTTP {e.response.status_code} from {e.request.url.copy_with(query=None)}: {e.response.text[:200]}")
     except httpx.TransportError as e:
         sys.exit(f"Cannot reach {e.request.url.copy_with(query=None)}: {e}")
+    except EOFError:
+        sys.exit("Input ended before every question was answered: pass --project, --app and --env to run without prompts.")
+    except RedactionError as e:
+        sys.exit(f"Redaction failed, stopping before sending anything further: {e}")
     except KeyboardInterrupt:
-        sys.exit("\nInterrupted. Progress up to the last sent batch is saved.")
+        sys.exit(interrupt_message())
