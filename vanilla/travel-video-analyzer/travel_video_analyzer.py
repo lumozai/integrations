@@ -4,7 +4,12 @@ Travel Video Analyzer - Framework-less Multi-Agent
 Uses OpenInference decorators (@tracer.chain, @tracer.tool) with direct Anthropic API.
 No LangGraph, LangChain, or other agent frameworks.
 
-Pipeline: extract_frames → analyze_frames → generate_tags
+Pipeline: handle_request (root) → analyze_video → extract_frames → analyze_frames → generate_tags
+
+The complete custom-instrumentation example for the Lumoz docs (Instrument > Custom
+instrumentation): one root span per run carrying the request, the answer, the session and the
+user; typed CHAIN / TOOL / LLM spans; failures recorded as an error status plus exception
+attributes; the last batch flushed before exit.
 """
 
 import base64
@@ -13,11 +18,14 @@ import os
 import re
 import sys
 import tempfile
+import traceback
+import uuid
 
 import anthropic
 import cv2
 from dotenv import load_dotenv
 from opentelemetry import trace
+from opentelemetry.trace import Status, StatusCode
 from opentelemetry.sdk.trace import TracerProvider, ReadableSpan
 from opentelemetry.sdk.trace.export import BatchSpanProcessor, SpanExporter
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
@@ -85,7 +93,12 @@ def _init_tracing():
     if not endpoint or not api_key:
         raise ValueError("OTEL_ENDPOINT and LUMOZ_API_KEY required")
 
-    resource = Resource.create({"service.name": "travel-video-analyzer-vanilla"})
+    # service.name is the application card in the Lumoz console; deployment.environment
+    # is the environment the traces are filed under.
+    resource = Resource.create({
+        "service.name": "travel-video-analyzer-vanilla",
+        "deployment.environment": os.environ.get("DEPLOYMENT_ENVIRONMENT", "development"),
+    })
     provider = TracerProvider(resource=resource)
     trace.set_tracer_provider(provider)
 
@@ -95,16 +108,32 @@ def _init_tracing():
     # This prevents large payloads that cause timeouts/retries and duplicate spans
     provider.add_span_processor(ImageStrippingSpanProcessor(exporter))
 
-    # Auto-instrument Anthropic client (must be before client creation)
+    # Auto-instrument Anthropic client (must be before client creation). It records each model
+    # call as an LLM span with llm.input_messages, llm.output_messages, llm.model_name and the
+    # token counts. To record those by hand instead, see the Model calls section of the guide.
     AnthropicInstrumentor().instrument(tracer_provider=provider)
 
     print(f"Tracing → {endpoint}")
-    return OITracer(trace.get_tracer(__name__), TraceConfig())
+    return OITracer(trace.get_tracer(__name__), TraceConfig()), provider
 
 
-tracer = _init_tracing()
+tracer, tracer_provider = _init_tracing()
 client = anthropic.Anthropic()  # Created AFTER instrumentation
 MODEL = "claude-sonnet-4-20250514"
+
+# The name Lumoz gives this run's business task. Anywhere in the root span's input.value.
+WORKFLOW_TAG = "[Workflow: Analyze Travel Video]"
+
+
+def fail(message: str) -> None:
+    """Record a failure the way Lumoz reads it: an error status on the current span plus the
+    exception as span attributes (a span event alone is not read), then raise so the spans
+    above fail too."""
+    span = trace.get_current_span()
+    span.set_status(Status(StatusCode.ERROR, message))
+    span.set_attribute("exception.type", "RuntimeError")
+    span.set_attribute("exception.message", message)
+    raise RuntimeError(message)
 
 
 # ============================================================================
@@ -122,11 +151,11 @@ def extract_frames(video_path: str, num_frames: int = 2) -> dict:
     span.set_attribute("video.requested_frames", num_frames)
 
     if not os.path.exists(video_path):
-        return {"error": f"Video not found: {video_path}"}
+        fail(f"Video not found: {video_path}")
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        return {"error": f"Could not open: {video_path}"}
+        fail(f"Could not open: {video_path}")
 
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = cap.get(cv2.CAP_PROP_FPS)
@@ -170,7 +199,7 @@ def analyze_frames(frame_paths: list[str]) -> dict:
     span.set_attribute("vision.model", MODEL)
 
     if not frame_paths:
-        return {"error": "No frames provided"}
+        fail("No frames provided")
 
     # Build image content for Claude Vision
     images = []
@@ -184,7 +213,7 @@ def analyze_frames(frame_paths: list[str]) -> dict:
             })
 
     if not images:
-        return {"error": "Could not load images"}
+        fail("Could not load images")
 
     # Call Claude Vision
     response = client.messages.create(
@@ -236,7 +265,7 @@ def generate_tags(destination_info: dict) -> dict:
     span.set_attribute("tags.model", MODEL)
 
     if not destination_info:
-        return {"error": "No destination info"}
+        fail("No destination info")
 
     response = client.messages.create(
         model=MODEL,
@@ -286,17 +315,9 @@ def analyze_video(video_path: str) -> dict:
     print(f"{'='*50}")
     print(f"Video: {video_path}")
 
-    # Step 1: Extract frames
+    # Each step raises on failure (see fail), so the error status reaches the root span.
     extraction = extract_frames(video_path)
-    if not extraction.get("success"):
-        return {"error": extraction.get("error")}
-
-    # Step 2: Analyze with Vision
     analysis = analyze_frames(extraction["frame_paths"])
-    if not analysis.get("success"):
-        return {"error": analysis.get("error")}
-
-    # Step 3: Generate tags
     tagging = generate_tags(analysis["destination_info"])
 
     return {
@@ -306,15 +327,48 @@ def analyze_video(video_path: str) -> dict:
     }
 
 
+# ============================================================================
+# The unit of work
+# ============================================================================
+
+def handle_request(video_path: str, session_id: str, user_id: str) -> dict:
+    """One run, one root span. The request goes in as input.value, the answer comes out as
+    output.value, and session.id / user.id ride on the root. This is what Lumoz names a
+    business task from and reads the outcome from."""
+    request = f"{WORKFLOW_TAG}\nAnalyze this travel video and tag its destination: {video_path}"
+    with tracer.start_as_current_span("handle_request") as root:
+        root.set_attribute("openinference.span.kind", "CHAIN")
+        root.set_attribute("input.value", request)
+        root.set_attribute("session.id", session_id)
+        root.set_attribute("user.id", user_id)
+        try:
+            result = analyze_video(video_path)
+        except Exception as exc:
+            root.set_status(Status(StatusCode.ERROR, str(exc)))
+            root.set_attribute("exception.type", type(exc).__name__)
+            root.set_attribute("exception.message", str(exc))
+            root.set_attribute("exception.stacktrace", traceback.format_exc())
+            raise
+        root.set_attribute("output.value", json.dumps(result))
+        return result
+
+
 def run_analysis(input: str) -> dict:
     """Entry point for experiment harness."""
     path = input.rsplit(":", 1)[-1].strip() if ":" in input else input
-    return analyze_video(path)
+    return handle_request(path, session_id=str(uuid.uuid4()), user_id="experiment-harness")
 
 
 if __name__ == "__main__":
     video = sys.argv[1] if len(sys.argv) > 1 else "./videos/travel-video-0.mp4"
-    result = analyze_video(video)
+    try:
+        result = handle_request(
+            video,
+            session_id=os.environ.get("SESSION_ID", str(uuid.uuid4())),
+            user_id=os.environ.get("USER_ID", "demo-user"),
+        )
+    finally:
+        tracer_provider.shutdown()  # flush the last batch before the process exits
 
     print("\n" + "="*50)
     print("RESULTS")
