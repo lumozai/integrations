@@ -29,6 +29,7 @@ from dotenv import load_dotenv
 load_dotenv(pathlib.Path(__file__).resolve().parent / ".env")
 
 ENVIRONMENT = os.environ.get("LUMOZ_ENVIRONMENT", "development")
+_PROVIDER = None
 
 
 def enable_cli_telemetry(service_name: str, endpoint: str, token: str) -> None:
@@ -54,7 +55,13 @@ def enable_cli_telemetry(service_name: str, endpoint: str, token: str) -> None:
 
 
 def setup(service_name: str):
-    """Install the instrumentor and switch on the CLI's telemetry. Returns the provider, or None."""
+    """Install the instrumentor and switch on the CLI's telemetry. Returns the provider, or None.
+
+    Safe to call more than once: the second call returns what the first one made.
+    """
+    global _PROVIDER
+    if _PROVIDER is not None:
+        return _PROVIDER
     endpoint, api_key = os.environ.get("OTEL_ENDPOINT"), os.environ.get("LUMOZ_API_KEY")
     if not endpoint or not api_key:
         print("[lumoz] LUMOZ_API_KEY or OTEL_ENDPOINT not set: tracing skipped")
@@ -79,4 +86,5 @@ def setup(service_name: str):
     enable_cli_telemetry(service_name, endpoint, token)
     atexit.register(provider.shutdown)
     print(f"[lumoz] {service_name} -> {endpoint} (instrumentor and Claude Code CLI telemetry)")
+    _PROVIDER = provider
     return provider
