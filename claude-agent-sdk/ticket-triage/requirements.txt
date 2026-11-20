@@ -1,0 +1,14 @@
+# Claude Agent SDK (runs the Claude Code CLI, which needs Node.js 18+)
+claude-agent-sdk>=0.2.183
+
+# The helpdesk MCP server over HTTP (the 2.x server API: MCPServer, middleware)
+mcp>=2.3,<3
+uvicorn>=0.30
+
+# OpenTelemetry and the OpenInference instrumentor, for Lumoz tracing
+opentelemetry-sdk>=1.45
+opentelemetry-exporter-otlp-proto-http>=1.45
+openinference-instrumentation-claude-agent-sdk>=0.1.29
+
+python-dotenv>=1.0
+anyio>=4.0

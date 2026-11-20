@@ -1,0 +1,18 @@
+[
+  {
+    "id": "tkt-4821",
+    "channel": "email",
+    "customer_email": "maya.lindqvist@example.com",
+    "subject": "Order arrived damaged",
+    "body": "My order A-10422 arrived yesterday and the monitor has a cracked panel. I need a working one before the 24th, it is for a presentation.",
+    "received_at": "2026-11-19T08:41:00Z"
+  },
+  {
+    "id": "tkt-4833",
+    "channel": "chat",
+    "customer_email": "devon.okafor@example.com",
+    "subject": "Charged twice",
+    "body": "I see two charges of $89.00 on my card for order A-10457 but I only ordered once. Please fix this.",
+    "received_at": "2026-11-19T09:02:00Z"
+  }
+]
