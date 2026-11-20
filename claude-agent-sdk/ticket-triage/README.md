@@ -57,7 +57,7 @@ A value already in the environment, or passed through `ClaudeAgentOptions.env`, 
 
 **MCP server's tracer** (`mcp_server.py`, `LumozToolSpans`). With its telemetry on, the CLI sends a `traceparent` header on every HTTP request to the server. The middleware starts one span per call on that context and exports it under the server's own service name: a TOOL span for a lookup, and a RETRIEVER span for the policy search, carrying the query and the documents it returned. The MCP SDK's built-in tracing middleware is replaced, because it reads request metadata the CLI does not send.
 
-## The query() path
+## query(): one-off tasks
 
 ```bash
 python runner.py
@@ -100,7 +100,7 @@ CHAIN  triage_ticket                       the job: instruction + ticket in, the
 - The policy search shows as a retrieval with its query and documents.
 - One small helper call per ticket arrives as a one-span trace of its own; it counts toward usage and is never a task.
 
-## The ClaudeSDKClient path
+## ClaudeSDKClient: continuous conversations
 
 ```bash
 python runner_client.py
